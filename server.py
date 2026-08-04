@@ -16,9 +16,9 @@ DIMS = ["content", "organization", "expression"]
 
 # 캘리브레이션: score = a * raw + b   (calibrate.py 결과로 교체)
 CALIB = json.loads(os.environ.get("CALIB", json.dumps({
-    "content":      {"a": 1.0, "b": 0.0},
-    "organization": {"a": 1.0, "b": 0.0},
-    "expression":   {"a": 1.0, "b": 0.0},
+    "content":      {"a": 0.5115, "b": 1.1582},
+    "organization": {"a": 0.7812, "b": 0.1981},
+    "expression":   {"a": 0.8437, "b": 0.2960},
 })))
 
 # train 2000건 실측 평균 (폴백용)
@@ -225,7 +225,7 @@ async def health():
     if _ready:
         return JSONResponse({"status": "ok"})
     try:
-        async with httpx.AsyncClient() as c:
+        async with httpx.AsyncClient(trust_env=False) as c:
             r = await c.get(f"{VLLM}/v1/models", timeout=5.0)
         if r.status_code == 200:
             _ready = True
@@ -255,7 +255,7 @@ async def chat(req: ChatReq):
 
     scores, rats = dict(FALLBACK), {}
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             raw = await asyncio.gather(
                 *[score_one(client, d, prompt_text, essay) for d in DIMS])
             for d, v in zip(DIMS, raw):
