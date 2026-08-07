@@ -1,164 +1,201 @@
-"""격자 탐색 캘리브레이션 + 프롬프트 효과 진단.
+"""격자 탐색 캘리브레이션 + 프롬프트 효과 진단 (고속판).
 
 사용:
-    python3 calibrate.py raw_v2.jsonl                    # 캘리브레이션
-    python3 calibrate.py raw_v2.jsonl raw_v1base.jsonl   # + 프롬프트 A/B 비교
+    python3 calibrate.py raw_v2full.jsonl
+    python3 calibrate.py raw_v2.jsonl raw_v1base.jsonl   # raw 기준 A/B
 
-GPU 불필요. raw 파일만 있으면 몇 초면 끝난다.
 
-두 가지를 분리해서 본다.
-  1) raw Spearman  — 캘리브레이션과 무관. 프롬프트가 신호를 늘렸는지 여기서만 알 수 있다.
-  2) 반올림 후 성능 — a, b를 어떻게 잡느냐의 문제. raw가 같아도 크게 달라진다.
+핵심: p = round(clip(a*raw+b,1,5)) 는 raw 위의 4개 경계로 완전히 결정된다.
+raw를 한 번 정렬해 두면 각 (a,b)는 searchsorted 4번 + 누적합 조회로 O(1)에 끝난다.
 """
-import json, sys, itertools
+import json, sys
 import numpy as np
-from scipy.stats import spearmanr
+from scipy.stats import rankdata, spearmanr
 
 DIMS = ["content", "organization", "expression"]
-# 대회 배점: RMSE 45 / Spearman 45 / Judge 10 → 둘을 같은 비중으로 본다.
-# RMSE는 낮을수록, Spearman은 높을수록 좋으므로 부호를 맞춘다.
-W_RMSE, W_SP = 0.5, 0.5
-KFOLD = 5
-SEED = 42
+MIN_SPREAD = 0.6
 
 
 def load(path):
     rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
     out = {}
     for d in DIMS:
-        raw = np.array([r["raw"].get(d, np.nan) for r in rows], dtype=float)
-        gold = np.array([r["gold"][d] for r in rows], dtype=float)
+        raw = np.array([r["raw"].get(d, np.nan) for r in rows], float)
+        gold = np.array([r["gold"][d] for r in rows], float)
         m = ~np.isnan(raw)
         out[d] = (raw[m], gold[m])
     return out, len(rows)
 
 
-def apply(a, b, raw):
-    return np.round(np.clip(a * raw + b, 1, 5))
+class Fast:
+    """정렬 + 누적합 사전계산. 이후 (a,b) 평가는 상수 시간."""
+    def __init__(self, raw, gold):
+        o = np.argsort(raw, kind="mergesort")
+        self.rs = raw[o]; self.gs = gold[o]
+        self.rk = rankdata(gold)[o]              # 정답의 타이 보정 순위
+        self.n = len(raw)
+        z = lambda v: np.concatenate([[0.0], np.cumsum(v)])
+        self.c_rk = z(self.rk); self.c_g = z(self.gs); self.c_g2 = z(self.gs ** 2)
+        self.rk_mean = self.rk.mean()
+        self.rk_sd = self.rk.std()
+        self.g_sd = gold.std()
+
+    def eval(self, a, b):
+        if a <= 0:
+            return None
+        # a*raw+b 가 k+0.5 를 넘는 지점 = 예측이 k+1로 바뀌는 raw 경계
+        t = [(k + 0.5 - b) / a for k in range(1, 5)]
+        idx = np.searchsorted(self.rs, t, side="left")
+        idx = np.clip(idx, 0, self.n)
+        bounds = [0] + list(idx) + [self.n]
+        n_k, sum_rk, sum_g, sum_g2, lv = [], [], [], [], []
+        for k in range(5):
+            i, j = bounds[k], bounds[k + 1]
+            if j <= i:
+                continue
+            n_k.append(j - i); lv.append(k + 1.0)
+            sum_rk.append(self.c_rk[j] - self.c_rk[i])
+            sum_g.append(self.c_g[j] - self.c_g[i])
+            sum_g2.append(self.c_g2[j] - self.c_g2[i])
+        if len(n_k) < 3:
+            return None
+        n_k = np.array(n_k, float); lv = np.array(lv)
+        sum_rk = np.array(sum_rk); sum_g = np.array(sum_g); sum_g2 = np.array(sum_g2)
+
+        # RMSE
+        sse = (lv ** 2 * n_k - 2 * lv * sum_g + sum_g2).sum()
+        rmse = float(np.sqrt(sse / self.n))
+
+        # 예측 분포의 표준편차 (변별력 붕괴 방지 제약)
+        mu = (lv * n_k).sum() / self.n
+        sd = float(np.sqrt((lv ** 2 * n_k).sum() / self.n - mu ** 2))
+        if sd < MIN_SPREAD * self.g_sd:
+            return None
+
+        # Spearman = 예측의 타이 보정 순위와 정답 순위의 Pearson
+        cum = np.concatenate([[0.0], np.cumsum(n_k)])
+        ar = cum[:-1] + (n_k + 1) / 2.0
+        p_mean = (ar * n_k).sum() / self.n
+        p_sd = np.sqrt((ar ** 2 * n_k).sum() / self.n - p_mean ** 2)
+        if p_sd <= 0:
+            return None
+        cov = (ar * sum_rk).sum() / self.n - p_mean * self.rk_mean
+        sp = float(cov / (p_sd * self.rk_sd))
+        return rmse, sp, sd, [int(x) for x in lv]
 
 
-def metrics(p, g):
-    rmse = float(np.sqrt(((p - g) ** 2).mean()))
-    if len(np.unique(p)) < 2:
-        return rmse, 0.0          # 전부 같은 값이면 순위 정보 없음
-    return rmse, float(spearmanr(p, g).statistic)
+def obj(rmse, sp):
+    return 0.5 * sp + 0.5 * (1 - min(rmse, 1.2) / 1.2)
 
 
-def score_of(rmse, sp):
-    # RMSE 하한 0.30, 상한 1.0 근처를 0~1로 정규화해 Spearman과 합산
-    return W_SP * sp + W_RMSE * (1 - min(rmse, 1.2) / 1.2)
+A = np.arange(0.30, 3.51, 0.05)
+B = np.arange(-6.0, 3.01, 0.05)
 
 
-def grid(raw, gold, a_range, b_range):
-    best = None
-    for a in a_range:
-        ar = a * raw
-        for b in b_range:
-            p = np.round(np.clip(ar + b, 1, 5))
-            rmse, sp = metrics(p, gold)
-            s = score_of(rmse, sp)
+def grid(raw, gold):
+    f = Fast(raw, gold); best = None
+    for a in A:
+        for b in B:
+            r = f.eval(a, b)
+            if r is None:
+                continue
+            s = obj(r[0], r[1])
             if best is None or s > best[0]:
-                best = (s, a, b, rmse, sp)
+                best = (s, float(a), float(b), r[0], r[1], r[3])
     return best
 
 
-def cv_grid(raw, gold, a_range, b_range, k=KFOLD):
-    """fold별로 train에서 a,b를 고르고 held-out에서 평가 → 정직한 추정치."""
-    rng = np.random.default_rng(SEED)
-    idx = rng.permutation(len(raw))
-    folds = np.array_split(idx, k)
-    rs, ss, picks = [], [], []
+def cv(raw, gold, k=5, seed=42):
+    idx = np.random.default_rng(seed).permutation(len(raw))
+    F = np.array_split(idx, k); R, S, P = [], [], []
     for i in range(k):
-        te = folds[i]
-        tr = np.concatenate([folds[j] for j in range(k) if j != i])
-        _, a, b, _, _ = grid(raw[tr], gold[tr], a_range, b_range)
-        rmse, sp = metrics(apply(a, b, raw[te]), gold[te])
-        rs.append(rmse); ss.append(sp); picks.append((a, b))
-    return float(np.mean(rs)), float(np.mean(ss)), picks
+        te = F[i]; tr = np.concatenate([F[j] for j in range(k) if j != i])
+        bb = grid(raw[tr], gold[tr])
+        if bb is None:
+            continue
+        _, a, b, *_ = bb
+        p = np.round(np.clip(a * raw[te] + b, 1, 5))
+        R.append(np.sqrt(((p - gold[te]) ** 2).mean()))
+        S.append(spearmanr(p, gold[te]).statistic if len(np.unique(p)) > 1 else 0.0)
+        P.append((round(a, 2), round(b, 2)))
+    return float(np.mean(R)), float(np.mean(S)), P
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "raw_v2.jsonl"
+    path = sys.argv[1]
     data, n = load(path)
     print(f"=== {path} (n={n}) ===\n")
 
-    A = np.arange(0.20, 6.01, 0.05)
-    B = np.arange(-14.0, 8.01, 0.05)
-
-    print("[1] raw 자체의 신호 — 캘리브레이션 이전, 프롬프트 품질의 척도")
+    print("[1] raw 신호 (캘리브레이션 무관)")
     for d in DIMS:
         raw, gold = data[d]
         print(f"  {d:13s} Spearman={spearmanr(raw, gold).statistic:+.4f} "
-              f"| raw 평균={raw.mean():.3f} 표준편차={raw.std():.3f} "
-              f"범위={raw.min():.2f}~{raw.max():.2f}")
+              f"| raw 평균={raw.mean():.3f} sd={raw.std():.3f} "
+              f"| 정답 평균={gold.mean():.3f} sd={gold.std():.3f}")
 
-    print("\n[2] 현재 계수 (구 규칙 최소제곱값) 적용 시")
-    CUR = {"content": (0.5115, 1.1582), "organization": (0.7812, 0.1981),
+    CUR = {"content": (0.95, -0.40), "organization": (1.15, -0.95),
+           "expression": (1.10, -0.90)}
+    OLD = {"content": (0.5115, 1.1582), "organization": (0.7812, 0.1981),
            "expression": (0.8437, 0.2960)}
-    cur_r, cur_s = [], []
-    for d in DIMS:
-        raw, gold = data[d]
-        a, b = CUR[d]
-        p = apply(a, b, raw)
-        rmse, sp = metrics(p, gold)
-        cur_r.append(rmse); cur_s.append(sp)
-        print(f"  {d:13s} RMSE={rmse:.4f} Spearman={sp:.4f} "
-              f"| 출력값={sorted(int(u) for u in np.unique(p))} "
-              f"| 예측평균={p.mean():.2f} 정답평균={gold.mean():.2f}")
-    print(f"  {'평균':13s} RMSE={np.mean(cur_r):.4f} Spearman={np.mean(cur_s):.4f}")
-
-    print("\n[3] 격자 탐색 — 전체 데이터에 최적화 (낙관적, 과적합 포함)")
-    best = {}
-    fit_r, fit_s = [], []
-    for d in DIMS:
-        raw, gold = data[d]
-        _, a, b, rmse, sp = grid(raw, gold, A, B)
-        best[d] = (a, b)
-        fit_r.append(rmse); fit_s.append(sp)
-        p = apply(a, b, raw)
-        print(f"  {d:13s} a={a:5.2f} b={b:6.2f} -> RMSE={rmse:.4f} Spearman={sp:.4f} "
-              f"| 출력값={sorted(int(u) for u in np.unique(p))}")
-    print(f"  {'평균':13s} RMSE={np.mean(fit_r):.4f} Spearman={np.mean(fit_s):.4f}")
-
-    print(f"\n[4] {KFOLD}-fold 교차검증 — 처음 보는 데이터에서 기대되는 성능")
-    cv_r, cv_s = [], []
-    for d in DIMS:
-        raw, gold = data[d]
-        rmse, sp, picks = cv_grid(raw, gold, A, B)
-        cv_r.append(rmse); cv_s.append(sp)
-        aa = [float(p[0]) for p in picks]
-        spread = max(aa) - min(aa)
-        flag = "  <- fold마다 a가 크게 흔들림. 신뢰도 낮음" if spread > 1.0 else ""
-        print(f"  {d:13s} RMSE={rmse:.4f} Spearman={sp:.4f} "
-              f"| fold별 a={[round(x,2) for x in aa]}{flag}")
-    print(f"  {'평균':13s} RMSE={np.mean(cv_r):.4f} Spearman={np.mean(cv_s):.4f}")
-
-    gap_s = np.mean(fit_s) - np.mean(cv_s)
-    print(f"\n  과적합 폭(Spearman): {gap_s:+.4f}"
-          f"{'  <- 크다. [3]의 값을 믿지 말 것' if gap_s > 0.05 else '  <- 허용 범위'}")
-
-    print("\n[5] server.py에 넣을 CALIB")
-    print(json.dumps({d: {"a": round(best[d][0], 4), "b": round(best[d][1], 4)}
-                      for d in DIMS}, indent=4, ensure_ascii=False))
-
-    # ---- 프롬프트 A/B ----
-    if len(sys.argv) > 2:
-        other = sys.argv[2]
-        d2, n2 = load(other)
-        print(f"\n\n=== 프롬프트 A/B: {path} vs {other} ===")
-        print("raw Spearman으로 비교한다. 반올림 후 수치는 a,b에 좌우되므로 프롬프트 판정에 쓸 수 없다.\n")
-        print(f"  {'영역':13s} {'v2(분석)':>10s} {'v1base':>10s} {'차이':>9s}")
+    for tag, C in (("[2] 1회차 계수", OLD), ("[3] 현재 계수 (100건에서 뽑은 값)", CUR)):
+        print(f"\n{tag}")
+        rs, ss = [], []
         for d in DIMS:
-            r1, g1 = data[d]; r2, g2 = d2[d]
-            s1 = spearmanr(r1, g1).statistic
-            s2 = spearmanr(r2, g2).statistic
-            mark = "개선" if s1 - s2 > 0.02 else ("악화" if s2 - s1 > 0.02 else "차이없음")
-            print(f"  {d:13s} {s1:+10.4f} {s2:+10.4f} {s1-s2:+9.4f}  {mark}")
-        n_eff = min(len(data['organization'][0]), len(d2['organization'][0]))
-        se = 1.0 / np.sqrt(max(n_eff - 3, 1))
-        print(f"\n  n={n_eff} 기준 Spearman 표준오차 ≈ {se:.3f}. "
-              f"차이가 {2*se:.2f} 미만이면 우연과 구별되지 않는다.")
+            raw, gold = data[d]; a, b = C[d]
+            p = np.round(np.clip(a * raw + b, 1, 5))
+            rm = np.sqrt(((p - gold) ** 2).mean())
+            sp = spearmanr(p, gold).statistic if len(np.unique(p)) > 1 else 0.0
+            rs.append(rm); ss.append(sp)
+            print(f"  {d:13s} RMSE={rm:.4f} Spearman={sp:.4f} "
+                  f"| 예측평균={p.mean():.3f} 출력값={sorted(int(u) for u in np.unique(p))}")
+        print(f"  {'평균':13s} RMSE={np.mean(rs):.4f} Spearman={np.mean(ss):.4f}")
+
+    print("\n[4] 400건 격자 탐색")
+    best = {}
+    rs, ss = [], []
+    for d in DIMS:
+        raw, gold = data[d]
+        _, a, b, rm, sp, lv = grid(raw, gold)
+        best[d] = (round(a, 4), round(b, 4)); rs.append(rm); ss.append(sp)
+        p = np.round(np.clip(a * raw + b, 1, 5))
+        print(f"  {d:13s} a={a:5.2f} b={b:6.2f} -> RMSE={rm:.4f} Spearman={sp:.4f} "
+              f"| 예측평균={p.mean():.3f} 출력값={lv}")
+    print(f"  {'평균':13s} RMSE={np.mean(rs):.4f} Spearman={np.mean(ss):.4f}")
+
+    print("\n[5] 5-fold 교차검증 (처음 보는 데이터 기준)")
+    cr, cs = [], []
+    for d in DIMS:
+        raw, gold = data[d]
+        rm, sp, picks = cv(raw, gold)
+        cr.append(rm); cs.append(sp)
+        aa = [p[0] for p in picks]
+        flag = "  <- fold간 a 편차 큼" if max(aa) - min(aa) > 0.6 else ""
+        print(f"  {d:13s} RMSE={rm:.4f} Spearman={sp:.4f} | fold별 a={aa}{flag}")
+    print(f"  {'평균':13s} RMSE={np.mean(cr):.4f} Spearman={np.mean(cs):.4f}")
+    print(f"\n  과적합 폭(Spearman): {np.mean(ss)-np.mean(cs):+.4f}")
+
+    print("\n[6] server.py CALIB")
+    print(json.dumps({d: {"a": best[d][0], "b": best[d][1]} for d in DIMS},
+                     indent=4, ensure_ascii=False))
 
 
-if __name__ == "__main__":
-    main()
+
+def ab_compare(p1, p2):
+    d1, _ = load(p1); d2, _ = load(p2)
+    print(f"\n\n=== 프롬프트 A/B: {p1} vs {p2} ===")
+    print("raw Spearman으로 비교한다. 반올림 후 수치는 a,b에 좌우되어 프롬프트 판정에 쓸 수 없다.\n")
+    print(f"  {'영역':13s} {'A':>10s} {'B':>10s} {'차이':>9s}")
+    for d in DIMS:
+        r1, g1 = d1[d]; r2, g2 = d2[d]
+        s1 = spearmanr(r1, g1).statistic; s2 = spearmanr(r2, g2).statistic
+        mark = "개선" if s1 - s2 > 0.02 else ("악화" if s2 - s1 > 0.02 else "차이없음")
+        print(f"  {d:13s} {s1:+10.4f} {s2:+10.4f} {s1-s2:+9.4f}  {mark}")
+    n = min(len(d1['content'][0]), len(d2['content'][0]))
+    se = 1.0 / np.sqrt(max(n - 3, 1))
+    print(f"\n  n={n} 기준 표준오차 ≈ {se:.3f}. 차이가 {2*se:.2f} 미만이면 우연과 구별되지 않는다.")
+
+
+
+main()
+if len(sys.argv) > 2:
+    ab_compare(sys.argv[1], sys.argv[2])
