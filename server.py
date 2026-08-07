@@ -15,10 +15,15 @@ SERVED = os.environ.get("SERVED_MODEL_NAME", "kwriting-scorer")
 DIMS = ["content", "organization", "expression"]
 
 # 캘리브레이션: score = a * raw + b   (calibrate.py 결과로 교체)
+# 2026-08-07 갱신. 구 규칙 최소제곱값(a<1)은 반올림 세계에서 모든 예측을
+# 같은 정수 칸에 밀어넣어 organization Spearman을 0.42 -> 0.22로 깎았다.
+# 아래는 raw_v2.jsonl 100건에 대한 제약 격자 탐색 결과(잠정).
+#   제약: 출력값 3종 이상, 예측 표준편차 >= 정답 표준편차의 60%
+#   b는 검증 표본의 정답 평균에 민감하다. 400건 재측정 후 확정할 것.
 CALIB = json.loads(os.environ.get("CALIB", json.dumps({
-    "content":      {"a": 0.5115, "b": 1.1582},
-    "organization": {"a": 0.7812, "b": 0.1981},
-    "expression":   {"a": 0.8437, "b": 0.2960},
+    "content":      {"a": 0.95, "b": -0.40},
+    "organization": {"a": 1.15, "b": -0.95},
+    "expression":   {"a": 1.10, "b": -0.90},
 })))
 
 # train 2000건 실측 평균 (폴백용)
