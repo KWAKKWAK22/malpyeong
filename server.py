@@ -42,6 +42,8 @@ SCALE = """5점: 매우 우수함. 결함이 거의 없고 구체적 강점이 �
 2점: 미흡함. 주요 결함이 있어 기준 충족이 제한적임.
 1점: 매우 미흡함. 기준을 거의 충족하지 못하거나 심각한 결함이 있음."""
 
+BRACES = str.maketrans("", "", "{}")
+
 app = FastAPI()
 _ready = False
 
@@ -60,7 +62,15 @@ def parse_input(text: str):
     return p, e
 
 
-def score_prompt(dim, prompt_text, essay):
+def score_prompt(dim, prompt_text, essay, analysis: str = ""):
+    block = ""
+    if analysis and dim in ANALYZED_DIMS:
+        block = f"""
+[사전 구조 분석]
+아래는 이 글을 기계적으로 분해한 결과이다. 판단의 근거로 활용하되,
+분석에 없는 내용은 원문을 직접 확인하라.
+{analysis}
+"""
     return f"""너는 한국어 논증적 글을 채점하는 엄격하고 일관된 평가자이다.
 
 [평가 영역]{dim}
@@ -74,9 +84,75 @@ def score_prompt(dim, prompt_text, essay):
 
 [논증적 글]
 {essay}
-
+{block}
 위 글의{dim} 영역 점수를 1~5 중 하나로 판단하라.
 설명 없이 숫자 하나만 출력하라."""
+
+
+ANALYSIS_MAXTOK = int(os.environ.get("ANALYSIS_MAXTOK", "420"))
+USE_ANALYSIS = os.environ.get("USE_ANALYSIS", "1") == "1"
+# 분석을 주입할 영역. expression은 국소 판단이라 현행 유지가 안전.
+ANALYZED_DIMS = set(
+    filter(None, os.environ.get("ANALYZED_DIMS", "content,organization").split(",")))
+
+
+def analysis_prompt(prompt_text, essay):
+    return f"""너는 한국어 논증적 글의 구조를 기계적으로 분해하는 분석기이다.
+점수를 매기지 말고, 평가하는 말도 쓰지 마라. 글에 있는 사실만 옮겨 적어라.
+
+[글쓰기 주제]
+{prompt_text}
+
+[논증적 글]
+{essay}
+
+아래 항목을 순서대로, 형식 그대로 채워라. 각 항목은 한 줄로 쓴다.
+없으면 "없음"이라고 쓴다. 추측하지 말고 글에 있는 표현을 그대로 인용한다.
+
+[문단수] (숫자만)
+[서론] 도입 역할을 하는 첫 문단의 첫 문장을 그대로 인용
+[주장] 글 전체의 중심 주장이 가장 뚜렷하게 드러난 문장을 그대로 인용
+[근거] 주장을 뒷받침하는 근거를 최대 4개까지 세미콜론(;)으로 구분해 요약
+[근거유형] 각 근거를 사례/통계/인용/일반론/개인경험 중 하나로 분류해 세미콜론으로 나열
+[문단시작표현] 두 번째 문단부터 각 문단의 첫 3어절을 세미콜론으로 나열
+[결론] 마지막 문단의 첫 문장을 그대로 인용
+[결론재진술] 마지막 문단이 앞의 주장을 다시 언급하는가 (예/아니오)
+[주제이탈] 주제와 직접 관련 없는 문단이 있는가 (있으면 그 문단의 첫 3어절, 없으면 없음)"""
+
+
+ANALYSIS_KEYS = ["문단수", "서론", "주장", "근거", "근거유형",
+                 "문단시작표현", "결론", "결론재진술", "주제이탈"]
+
+
+def parse_analysis(text: str) -> str:
+    """모델 출력에서 항목만 추려 정규화. 형식을 벗어나면 빈 문자열."""
+    if not text:
+        return ""
+    lines = []
+    for k in ANALYSIS_KEYS:
+        m = re.search(rf"\[\s*{k}\s*\]\s*(.*)", text)
+        if m:
+            v = m.group(1).strip().translate(BRACES)
+            v = re.sub(r"\s+", " ", v)[:300]
+            if v:
+                lines.append(f"- {k}: {v}")
+    # 절반 미만만 잡히면 신뢰하지 않는다
+    if len(lines) < len(ANALYSIS_KEYS) // 2:
+        return ""
+    return "\n".join(lines)
+
+
+async def analyze(client, prompt_text, essay) -> str:
+    if not USE_ANALYSIS:
+        return ""
+    try:
+        msgs = [{"role": "user",
+                 "content": analysis_prompt(prompt_text, essay)}]
+        d = await call_vllm(client, msgs, ANALYSIS_MAXTOK)
+        return parse_analysis(d["choices"][0]["message"]["content"])
+    except Exception as ex:
+        log.warning("analysis failed:%s", ex)
+        return ""
 
 
 def rationale_prompt(prompt_text, essay, scores):
@@ -170,8 +246,9 @@ async def sample_fallback(client, messages) -> Optional[float]:
     return None
 
 
-async def score_one(client, dim, prompt_text, essay) -> float:
-    msgs = [{"role": "user", "content": score_prompt(dim, prompt_text, essay)}]
+async def score_one(client, dim, prompt_text, essay, analysis="") -> float:
+    msgs = [{"role": "user",
+             "content": score_prompt(dim, prompt_text, essay, analysis)}]
     try:
         d = await call_vllm(client, msgs, 4, logprobs=True, top_logprobs=20)
         v = expectation_from_logprobs(d)
@@ -192,7 +269,6 @@ def parse_rationales(text: str) -> Dict[str, str]:
     return out
 
 
-BRACES = str.maketrans("", "", "{}")
 DEFAULT_R = {
     "content": "제시된 글의 주장과 근거의 관계를 검토하여 판단하였다.",
     "organization": "글의 문단 구조와 논리 전개 순서를 검토하여 판단하였다.",
@@ -206,6 +282,18 @@ def clean(t: str, dim: str) -> str:
     if len(t) < 10:
         return DEFAULT_R[dim]
     return t[:900]
+
+
+_DEBUG = {"on": os.environ.get("DEBUG_RAW", "0") == "1", "last": None}
+
+# 평가 서버가 실수 출력을 반올림하므로, 반올림 후 값이 실제 제출 점수다.
+ROUND_OUT = os.environ.get("ROUND_OUT", "1") == "1"
+
+
+def calibrate(dim: str, v: float) -> float:
+    a, b = CALIB[dim]["a"], CALIB[dim]["b"]
+    x = max(1.0, min(5.0, a * v + b))
+    return float(round(x)) if ROUND_OUT else round(x, 3)
 
 
 class ChatReq(BaseModel):
@@ -254,13 +342,20 @@ async def chat(req: ChatReq):
     prompt_text, essay = parse_input(user_text)
 
     scores, rats = dict(FALLBACK), {}
+    raw_map = {}
+    analysis = ""
     try:
         async with httpx.AsyncClient(trust_env=False) as client:
+            # 1단계: 구조 분해 (전 영역 공용, 1회)
+            analysis = await analyze(client, prompt_text, essay)
+            # 2단계: 영역별 점수 (logprobs 기댓값) — 병렬
             raw = await asyncio.gather(
-                *[score_one(client, d, prompt_text, essay) for d in DIMS])
+                *[score_one(client, d, prompt_text, essay, analysis)
+                  for d in DIMS])
             for d, v in zip(DIMS, raw):
-                a, b = CALIB[d]["a"], CALIB[d]["b"]
-                scores[d] = max(1.0, min(5.0, round(a * v + b, 3)))
+                raw_map[d] = v
+                scores[d] = calibrate(d, v)
+            # 3단계: 확정 점수를 조건으로 근거 생성
             rmsg = [{"role": "user",
                      "content": rationale_prompt(prompt_text, essay, scores)}]
             rd = await call_vllm(client, rmsg, 700)
@@ -270,6 +365,8 @@ async def chat(req: ChatReq):
 
     obj = {d: {"score": scores[d], "rationale": clean(rats.get(d), d)}
            for d in DIMS}
+    if _DEBUG.get("on"):
+        _DEBUG["last"] = {"raw": raw_map, "analysis": analysis}
     return JSONResponse({
         "id": f"chatcmpl-{int(time.time()*1000)}",
         "object": "chat.completion",
@@ -283,3 +380,8 @@ async def chat(req: ChatReq):
         }],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     })
+
+
+@app.get("/debug/last")
+async def debug_last():
+    return JSONResponse(_DEBUG.get("last") or {})
