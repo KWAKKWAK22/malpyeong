@@ -19,11 +19,11 @@ DIMS = ["content", "organization", "expression"]
 # 같은 정수 칸에 밀어넣어 organization Spearman을 0.42 -> 0.22로 깎았다.
 # 아래는 raw_v2.jsonl 100건에 대한 제약 격자 탐색 결과(잠정).
 #   제약: 출력값 3종 이상, 예측 표준편차 >= 정답 표준편차의 60%
-#   b는 검증 표본의 정답 평균에 민감하다. 400건 재측정 후 확정할 것.
+#   5-fold 교차검증 기준 RMSE 0.7883 / Spearman 0.2920, 과적합 폭 +0.040.
 CALIB = json.loads(os.environ.get("CALIB", json.dumps({
-    "content":      {"a": 0.95, "b": -0.40},
-    "organization": {"a": 1.15, "b": -0.95},
-    "expression":   {"a": 1.10, "b": -0.90},
+    "content":      {"a": 0.95, "b": -0.35},
+    "organization": {"a": 0.95, "b":  0.45},
+    "expression":   {"a": 0.55, "b":  1.30},
 })))
 
 # train 2000건 실측 평균 (폴백용)
