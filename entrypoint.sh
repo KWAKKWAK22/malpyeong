@@ -9,4 +9,5 @@ python3 -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization 0.85 \
   --dtype bfloat16 &
 
+cd /app
 exec python3 -m uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1
