@@ -289,7 +289,9 @@ def clean(t: str, dim: str) -> str:
     return t[:900]
 
 
-_DEBUG = {"on": os.environ.get("DEBUG_RAW", "0") == "1", "last": None}
+# 마지막 요청의 raw 값을 항상 보관한다. 평가 서버는 /debug/last 를 호출하지 않으므로
+# 켜 두어도 부작용이 없고, 제출 이미지에서도 환경변수 없이 raw 대조가 가능하다.
+_DEBUG = {"on": True, "last": None}
 
 # 평가 서버가 실수 출력을 반올림하므로, 반올림 후 값이 실제 제출 점수다.
 ROUND_OUT = os.environ.get("ROUND_OUT", "1") == "1"
