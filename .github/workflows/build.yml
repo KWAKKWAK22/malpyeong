@@ -1,8 +1,13 @@
 name: build
 on:
   push:
-    branches: [main]
+    tags: ['v*']          # v2.0.0 처럼 태그를 밀 때만 빌드
   workflow_dispatch:
+    inputs:
+      tag:
+        description: '이미지 태그 (예: v2.0.0)'
+        required: true
+        default: 'v2.0.0'
 jobs:
   docker:
     runs-on: ubuntu-latest
@@ -12,6 +17,14 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
           df -h
+      - name: Resolve tag
+        id: t
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -20,4 +33,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/malpyeong:v1.0.0
+          # 고정 버전 태그만 푼다 (제출 규정 9절: mutable tag 금지 권고)
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/malpyeong:${{ steps.t.outputs.tag }}
+      - name: Summary
+        run: echo "제출용 modelUrl → ${{ secrets.DOCKERHUB_USERNAME }}/malpyeong:${{ steps.t.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
